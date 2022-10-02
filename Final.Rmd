@@ -1,0 +1,1255 @@
+---
+title: "Applying Machine Learning to Predict Wine Quality Ratings"
+author: "Will Firmin"
+date: "5/22/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, cache=F, message=F, warning=F, fig.show="hold")
+options(tinytex.verbose=T)
+```
+
+```{r, warning=F, message=F}
+rm(list=ls())
+library(caret) #trainControl
+library(boot) #cv.glm
+library(leaps)
+library(splines)
+library(gam)
+library(MASS) #stepwise selection
+library(glmnet) #ridge/lasso
+library(vip) #lasso important variables
+library(lava)
+library(plotfunctions) #Gradient legend
+library(randomForest)
+library(tree)
+library(gbm)
+library(factoextra)
+library(e1071) #SVM
+library(pls) #PCA
+library(ggplot2)
+```
+
+For this project I used data on samples of wine from Northern Portugal.  The data includes 12 variables: 11 are results from physico-chemical tests on the wine, and the final variable is a quality rating from 1 to 10.  In the data, only ratings from 3 to 8 are present.  The aim of the project is to use these physico-chemical properties of wine to predict its quality.  The plots below show the relationship between quality and each predictor variable.  Since there are only six discrete levels on the y axis, a scatter plot is hard to read.  Therefore I have used box plots to show the distribution for each level of quality.  The most significant relationships seem to be with volatile acidity, citric acid, sulphates, and alcohol.  The final plot shows the frequency of each rating level.  It's important to note that the data is dominated by middle values 5 and 6, with few observations of very good or bad ratings.  For this reason, classification will be applied first to two classes: "Good" signifying a score greater than or equal to 6, and "Bad" signifying a score less than or equal to 5.  Later I will apply classification with six classes, one for each rating level.  Finally, I will use regression methods.
+
+```{r, out.width="33%"}
+wine = read.csv("winequality-red.csv")
+head(wine)
+labels = c(fixed.acidity="Fixed Acidity",
+           volatile.acidity="Volatile Acidity",
+           citric.acid="Citric Acid",
+           residual.sugar="Residual Sugar",
+           chlorides="Chlorides",
+           free.sulfur.dioxide="Free Sulfur Dioxide",
+           total.sulfur.dioxide="Total Sulfur Dioxide",
+           density="Density",
+           pH="pH",
+           sulphates="Sulphates",
+           alcohol="Alcohol",
+           quality="Quality")
+
+for(var in colnames(wine)[colnames(wine)!="quality"]){
+  formula = as.formula(paste(var,"~ quality"))
+  boxplot(formula, wine, horizontal=T, ylab="Quality",xlab=labels[var], main=labels[var])
+}
+barplot(table(wine$quality), xlab="Quality",ylab="Frequency",main="Frequency of Ratings")
+
+X = wine
+X$quality = NULL
+Y = wine$quality
+
+set.seed(123)
+sampleSize = round(0.7*nrow(wine))
+train = sample((1:nrow(wine)),sampleSize)
+
+```
+
+
+## Binary Classification
+
+### Logistic Regression
+The first model applied to the "Good" vs "Bad" classification problem is logistic regression.  The summary of the model shows that the most significant predictors are volatile acidity, citric acid, total sulfur dioxide, sulphates, and alcohol.  This is largely consistent with the visual observations made above.  The table of predictions indicates that the majority are correctly classified.  The accuracy of the model on the validation set is about 74%, which is much greater than simply guessing.  Guessing the most common rating (Good) gives an accuracy of 51.25%, far below 74%.
+
+```{r}
+wineC = wine
+wineC$quality = as.numeric(wineC$quality > 5)
+
+#Logistic: good vs bad
+model.log = glm(quality ~ ., data = wineC, subset=train, family="binomial")
+summary(model.log)
+log.pred = round(predict(model.log, wineC[-train,], type="response"))
+table(log.pred, wineC[-train,"quality"])
+log.acc = mean(log.pred == wineC[-train, "quality"])
+print(paste("Logistic Binary Classification Accuracy:",log.acc),quote=F)
+```
+
+### Linear Discriminant Analysis
+The next model, LDA, is trained with cross validation.  The group means reported by the model show that there are sizable differences between good and bad wine in some predictors.  The plot shows that the two classes are somewhat separated, allowing for some accurate classification.  The LDA model resulted in a cross validation accuracy of about 74% and a validation set accuracy of 73.8%.  This is slightly less accurate than the logistic regression model.
+
+```{r}
+#LDA
+train.control = trainControl(method = "cv", number = 10)
+lda.fit = lda(quality ~ ., data = wineC, subset=train)
+print(lda.fit)
+plot(lda.fit)
+
+lda.model = train(factor(quality) ~ ., data=wineC, method="lda", subset=train, trControl=train.control)
+print(lda.model)
+lda.pred = predict(lda.model, wineC[-train,])
+table(lda.pred, wineC[-train,"quality"])
+lda.acc = mean(lda.pred == wineC[-train, "quality"])
+print(paste("LDA Accuracy:",lda.acc),quote=FALSE)
+```
+
+### Quadratic Discriminant Analysis
+The QDA model is applied next, and it finds a cross validation accuracy of only 71.8% and a validation set accuracy of 69.8%.  This decrease in accuracy from the logistic and LDA models indicate a more linear relationship in the data.
+
+```{r}
+qda.model = train(factor(quality) ~ ., data=wineC, method="qda", subset=train, trControl=train.control)
+print(qda.model)
+qda.pred = predict(qda.model, wineC[-train,])
+table(qda.pred, wineC[-train,"quality"])
+qda.acc = mean(qda.pred == wineC[-train, "quality"])
+print(paste("QDA Accuracy:",qda.acc),quote=FALSE)
+```
+
+### K Nearest Neighbors
+The KNN model is applied with the value of K being selected through cross validation.  The most accurate model during cross validation uses the 15 nearest data points and has an accuracy of 74.8%.  However, its accuracy on the validation set is only 69.4%.  This would confirm the earlier suspicion that a linear model is best.
+
+```{r}
+#KNN
+set.seed(7564)
+knn.model = train(factor(quality) ~ ., data=wineC, method="knn", trControl = train.control, subset=train, preProcess=c("center","scale"), tuneLength=20)
+#print(knn.model)
+plot(knn.model$results$k, knn.model$results$Accuracy, type='l', main="KNN CV Results",xlab="K",ylab="Accuracy")
+predK = predict(knn.model, wineC[-train,])
+table(predK, wineC[-train, "quality"])
+accuracyK = mean(predK == wineC[-train, "quality"])
+print(paste("KNN Accuracy:",accuracyK),quote=FALSE)
+```
+
+### Classification Tree
+A simple classification tree model finds that alcohol, sulphates, total sulfur dioxide, and volatile acidity are the strongest predictors.  This is consistent with earlier findings.  The plot of the tree shows that alcohol is used to make the first split, followed by sulphates.  It seems like higher values for alcohol and sulphates lead to higher ratings.  Lower values for total sulfur dioxide and volatile acidity appear to increase ratings, but this might only be in the subsections of the data split by alcohol and sulphates.  I use cross validation to find the optimal length of the tree, which is the full complexity.  The plot also shows that most improvement has been made by the time the tree reaches 5 terminal nodes, so I will test both models.  On the validation set, the full tree scores an accuracy of 70.6%, while the pruned tree scores 65.6%.  This is expected given the cross validation results, but the pruned tree has the worst accuracy of all the models so far, so the tree is not worth pruning.
+
+```{r, out.width="50%"}
+#Binary Classification Tree
+set.seed(959)
+tree.class = tree(factor(quality) ~ ., data=wineC, subset=train)
+summary(tree.class)
+
+plot(tree.class, main="Classification Tree")
+text(tree.class, pretty=0)
+
+treeCV.class = cv.tree(tree.class)
+plot(treeCV.class$size, treeCV.class$dev, type="b", main="CV Results: Classification Tree", xlab="Tree Size", ylab="Error")
+# Best at 5 or most complicated
+
+prune.class = prune.tree(tree.class, best=5)
+plot(prune.class)
+text(prune.class, pretty=0)
+# Both terminal nodes on the right are 1?
+
+class.pred = predict(tree.class, wineC[-train,], type="class")
+class.acc = mean(class.pred == wineC[-train, "quality"])
+print(paste("Full Tree Accuracy:",class.acc),quote=F)
+
+prune.pred = predict(prune.class, wineC[-train,], type="class")
+prune.acc = mean(prune.pred == wineC[-train, "quality"])
+print(paste("Pruned Tree Accuracy:",prune.acc),quote=F)
+```
+
+### Support Vector Machines
+#### Support Vector Classifier
+The SVC model is fitted using cross validation on a range of cost values.  The best value comes at cost = 0.2976.  Using this parameter, the SVC model score an accuracy of 72.9% on the validation set.  This is not the best so far, but it is better than the trees.
+
+```{r}
+#SVC
+set.seed(656)
+cost = 10^c(-3,-2, seq(-1,2, length=20), 3)
+#tune.out = tune(svm, as.factor(quality)~., data=wineC[train,], kernel="linear", ranges=list(cost=cost))
+tune.out = readRDS("tuneOutSVC.RData")
+tune.out$best.parameters
+
+svm1 = tune.out$best.model
+svm.pred = predict(svm1, wineC[-train,])
+table(svm.pred, wineC[-train, "quality"])
+svm.acc = mean(svm.pred == wineC[-train, "quality"])
+print(paste("SVC Accuracy:",svm.acc),quote=F)
+```
+
+#### Radial SVM
+The radial SVM is fit similarly to the SVC model using cross validation on a range of both cost and gamma values.  The best performing model has cost = 0.8859 and gamma = 0.4642.  The cost parameter for this model is higher than the SVC model.  The validation set accuracy reaches 75.6%, the highest of any model so far.
+
+```{r}
+#SVM Radial
+set.seed(650)
+cost = 10^c(-3,-2, seq(-1,2, length=20), 3)
+gamma = 10^c(-3,-2, seq(-1,2, length=10), 3)
+
+#tune.outR = tune(svm, as.factor(quality)~., data=wineC[train,], kernel="radial", ranges=list(cost=cost, gamma=gamma))
+tune.outR = readRDS("tuneOutR.RData")
+
+tune.outR$best.parameters
+
+svmR = tune.outR$best.model
+svmR.pred = predict(svmR, wineC[-train,])
+table(svmR.pred, wineC[-train, "quality"])
+svmR.acc = mean(svmR.pred == wineC[-train, "quality"])
+print(paste("SVM (Radial) Accuracy:",svmR.acc),quote=F)
+```
+
+#### Polynomial SVM
+The polynomial SVM is fit like the rest, using cross validation to select both cost and degree.  The best model here uses cost=1000 and degree=2.371.  The cost parameter is much higher than the other models, and the resulting accuracy of this SVM is 61.0%, doing much worse than the other two support vector methods.  The prediction table shows that when the true value is 0, the model has a hard time figuring this out, guessing 1 and 0 almost equally.  The other two support vector models did not have this problem.
+
+```{r}
+set.seed(659)
+degree = 10^c(-3,-2, seq(-1,2, length=20), 3)
+degree = 10^seq(-3,1.5, length=5)
+cost2 = 10^seq(-3,3,length=5)
+#tune.outP = tune(svm, as.factor(quality)~., data=wineC[train,], kernel="polynomial", ranges=list(cost=cost2, degree=degree))
+tune.outP = readRDS("tuneOutP.RData")
+tune.outP$best.parameters
+
+svmP = tune.outP$best.model
+svmP.pred = predict(svmP, wineC[-train,])
+table(svmP.pred, wineC[-train, "quality"])
+svmP.acc = mean(svmP.pred == wineC[-train, "quality"])
+print(paste("SVM (Polynomial) Accuracy:",svmP.acc))
+```
+
+### K Means Clustering
+Finally, I use K Means clustering to see if there are any interesting clusters within the data.  I specify two clusters with the aim of observing some kind of separation between good and bad wine.  When comparing the quality compositions of each cluster, there appears to be significant separation.  Cluster 1 is made up mostly of good wine, while cluster 2 is dominated by bad wine in an almost 2:1 ratio.  
+
+```{r}
+#K-Means
+set.seed(4)
+totalAccK = c()
+C=2
+kmean_model = kmeans(wineC[,-12], centers=C)
+
+fviz_cluster(kmean_model, data=wineC[,-12], main="Clusters", repel=TRUE)
+
+results = c(Good=1,Bad=0)
+accuracyKM = 0
+for(k in (1:C)){
+  print(paste("Cluster",k), quote=FALSE)
+  result = wineC$quality[kmean_model$cluster == k]
+  choice = c()
+  for(res in names(results)){
+    choice[res] = sum(result == results[res])/length(result)
+    print(paste(names(results[which(results==results[res])]),":",choice[res]),quote=FALSE)
+  }
+  choice1 = names(choice[which(choice==max(choice))])
+  accuracyKM = accuracyKM + sum(result == results[choice1])
+}
+
+```
+
+## Multiclass Classification
+Going forward, I use the same or similar models to classify the wine into distinct ratings.  Since the data is dominated by ratings of 5 and 6, this will likely be reflected in the results.  For future comparison with regression methods, I will also evaluate models based on their RMSE.  First, I use the mean rating of the training set and calculate the RMSE from using that as a prediction.  This results in an RMSE of 0.7629, which I will use as a benchmark for other models.
+
+```{r}
+set.seed(555)
+#Mean benchmark:
+mean.pred = rep(mean(wine[train,"quality"]),nrow(wine)-sampleSize)
+mean.RMSE = sqrt(mean((mean.pred-wine[-train,"quality"])^2))
+print(paste("RMSE from Training Mean:",mean.RMSE),quote=F)
+```
+
+### Logistic Regression
+Using a multinomial logistic regression, it achieves an accuracy of 63.1%.  The prediction tables show how the model is dominated by ratings of 5 and 6, with no guesses for 8 and only one guess for 3.  The model is decently accurate for ratings of 7, correctly identifying 20 out of 48 ratings of 7 and being correct in 20 out of 31 predictions for 7.  This is despite the fact that these ratings make up a small portion of the data.  The RMSE is 0.6630, which is about 0.1 lower than the base RMSE from the mean.  The box plot shows the true values against the predicted values.  Since the true values are very discrete, a scatter plot is difficult to read.  Therefore I use box plots to better represent the distribution of predictions for each true rating.  The box plots are by true rating so they can be compared to those for regression, when the predictions are not discrete.  We can see from this plot that the model consistently guesses 5s correctly.  The plot would ideally show a strong positive correlation between the predictions and actual values, but that isn't exactly the case here.
+
+```{r, results="hide"}
+#Logistic
+model.log2 = train(factor(quality) ~ ., data=wine, method="multinom", trControl = train.control, subset=train)
+```
+
+
+```{r}
+factorToNum = function(v){
+  return(as.numeric(as.character(v)))
+}
+
+summary(model.log2)
+log.pred2 = predict(model.log2, wine[-train,])
+table(log.pred2, wine[-train,"quality"])
+log.acc2 = mean(log.pred2 == wine[-train, "quality"])
+print(paste("Logistic Multiclass Accuracy:",log.acc2),quote=F)
+
+log.RMSE = sqrt(mean((factorToNum(log.pred2) - wine[-train, "quality"])^2))
+print(paste("Logistic RMSE:",log.RMSE),quote=F)
+
+boxplot(factorToNum(log.pred2) ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Logistic: Predicted vs Actual Values")
+```
+
+### Linear Discriminant Analysis
+Reapplying the LDA model, cross validation reports an accuracy of 57.1%.  The validation set gives 61.7% and an RMSE of 0.6997.  This is worse than the logistic model in both aspects.  The plot of the predicted vs actual values is very similar to that for the logistic model.  There are a few more predictions on the extreme ends, which show up on the plot as outliers.  QDA could not be performed for the multiclass data since one of the classes did not have enough data for the model to be fitted.
+
+```{r, out.width="50%"}
+#LDA
+lda.fit2 = lda(quality ~ ., data = wine, subset=train)
+print(lda.fit2)
+plot(lda.fit2)
+
+lda.model2 = train(factor(quality) ~ ., data=wine, method="lda", subset=train, trControl=train.control)
+print(lda.model2)
+lda.pred2 = predict(lda.model2, wine[-train,])
+table(lda.pred2, wine[-train,"quality"])
+lda.acc2 = mean(lda.pred2 == wine[-train, "quality"])
+print(paste("LDA Accuracy:",lda.acc2),quote=FALSE)
+
+lda.RMSE = sqrt(mean((factorToNum(lda.pred2) - wine[-train,"quality"])^2))
+print(paste("LDA RMSE:",lda.RMSE),quote=F)
+boxplot(factorToNum(lda.pred2) ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="LDA: Predicted vs Actual Values")
+
+```
+
+### K Nearest Neighbors
+The KNN model is again applied with cross validation over a range of K values.  This time, the best parameter was selected as K=17 with a training accuracy of 59.1%.  The validation set accuracy is 58.3%, and the RMSE is 0.7486.  This is much worse than the previous methods and is close to the mean guess.  This is consistent with the previous finding that the relationship between quality and the variables is more linear.  The plot shows decent performance for ratings of 5 and 6, but the other ratings are all over the place.
+
+```{r, out.width="50%"}
+#KNN
+set.seed(340)
+knn.model2 = train(factor(quality) ~ ., data=wine, method="knn", trControl = train.control, subset=train, preProcess=c("center","scale"), tuneLength=50)
+#print(knn.model2)
+plot(knn.model2$results$k, knn.model2$results$Accuracy, type='l', ylab="Accuracy",xlab="K",main="KNN CV Results")
+predK2 = predict(knn.model2, wine[-train,])
+table(predK2, wine[-train, "quality"])
+accuracyK2 = mean(predK2 == wine[-train, "quality"])
+print(paste("KNN Accuracy:",accuracyK2),quote=FALSE)
+
+knn.RMSE = sqrt(mean((factorToNum(predK2) - wine[-train, "quality"])^2))
+print(paste("KNN RMSE:",knn.RMSE))
+boxplot(factorToNum(predK2) ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="KNN: Predicted vs Actual Values")
+
+```
+
+### Classification Tree
+The classification tree uses the same variables as before.  The tree mainly indicates that greater alcohol content leads to higher ratings.  Cross validation shows that pruning the tree to a size of 6 is best.  This makes alcohol the only variable in the tree that changes the outcome.  There are several sibling terminal nodes that have the same outcome.  This pruned tree has an accuracy of 56.0% and an RMSE of 0.7624.  This is about 0.005 lower than the mean guess RMSE, so this is not a good model.  It is worth noting that the mean guess RMSE might have a small benefit in not being an integer, whereas the classification techniques only guess integers.  This would allow the mean to be closer on average to actual values.  This model only makes predictions of 5 or 6 based on the tree diagram, but interestingly the plot of predictions and actual values indicates that there are some predictions for 7.  According to the plot, almost all of the true 5 ratings are predicted as such.  Most of the 6 ratings, however, are also predicted as 5.
+
+```{r, out.width="50%"}
+#Multiclass Classification Tree
+set.seed(959)
+tree.class2 = tree(factor(quality) ~ ., data=wine, subset=train)
+summary(tree.class2)
+
+plot(tree.class2, main="Classification Tree")
+text(tree.class2, pretty=0)
+
+treeCV.class2 = cv.tree(tree.class2)
+plot(treeCV.class2$size, treeCV.class2$dev, type="b", main="CV Results: Classification Tree", xlab="Tree Size", ylab="Error")
+# Best at 6
+
+prune.class2 = prune.tree(tree.class2, best=6)
+plot(prune.class2)
+text(prune.class2, pretty=0)
+# Both terminal nodes on the right are 1?
+
+prune.pred2 = predict(prune.class2, wine[-train,], type="class")
+prune.acc2 = mean(prune.pred2 == wine[-train, "quality"])
+print(paste("Pruned Accuracy:",prune.acc2),quote=F)
+
+prune.RMSE = sqrt(mean((factorToNum(prune.pred2) - wine[-train,"quality"])^2))
+print(paste("Pruned RMSE:",prune.RMSE),quote=F)
+
+boxplot(factorToNum(prune.pred2) ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Classification Tree: Predicted vs Actual Values")
+```
+
+### K Means Clustering
+I use K Means clustering again but with 6 centers, one for each rating.  Looking at the rating composition of each cluster, cluster 1 is very representative of the overall distribution.  The other 5 clusters are different.  Cluster 2 is heavier on the high ratings, having more 6s and 7s.  Cluster 3 is very similar, and cluster 4 is dominated with 87% 5s.  Cluster 5 has more 7s than normal (about 20%), and cluster 6 has more (65%) 5s.
+
+```{r}
+#K-Means
+set.seed(5556)
+kmean_model2 = kmeans(wine[,-12], centers=6)
+
+fviz_cluster(kmean_model2, data=wine[,-12], main="Clusters", repel=TRUE)
+
+results = (3:8)
+for(k in (1:6)){
+  print(paste("Cluster",k), quote=FALSE)
+  result = wine$quality[kmean_model2$cluster == k]
+  for(res in results){
+    frequ = sum(result == res)/length(result)
+    print(paste(res,":",frequ),quote=FALSE)
+  }
+}
+
+```
+
+## Regression
+### Linear Regression
+Moving from classification to regression, a simple linear regression finds that the most important variables are volatile acidity, chlorides, total sulfur dioxide, sulphates, and alcohol.  This is mostly consistent with previous findings.  The RMSE from this linear model is 0.6063, which is much better than all previous models.  It also strengthens the claim of a linear relationship between ratings and the other variables.  The plot shows a much stronger trend than previous models, although the predictions mostly range between 5 and 6.5.
+
+```{r}
+#Linear benchmark:
+lin_model = lm(quality ~., data=wine)
+summary(lin_model)
+lin.pred = predict(lin_model, newdata=wine[-train,])
+lin.RMSE = sqrt(mean((lin.pred-wine[-train,"quality"])^2))
+print(paste("Linear RMSE:",lin.RMSE),quote=F)
+boxplot(lin.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Linear: Predicted vs Actual Values")
+```
+
+### Regression Tree
+The regression tree finds the same important variables as previous models, with the inclusion of pH.  The tree again begins with alcohol content, followed by sulphates.  Cross validation finds that the best size is 9, so I prune the tree to this length.  The tree shows that greater values in alcohol and sulphates lead to higher ratings, while lower values in volatile acidity and total sulfur dioxide do the same.  The RMSE for this tree is 0.6343, which is greater than all previous models but the linear regression.  The plot shows a decent upward trend, but not as strong as the linear model's.
+
+```{r, out.width="50%"}
+#Regression Tree
+set.seed(9595)
+tree.reg = tree(quality ~ ., data=wine, subset=train)
+summary(tree.reg)
+
+plot(tree.reg, main="Classification Tree")
+text(tree.reg, pretty=0)
+
+treeCV.reg = cv.tree(tree.reg)
+plot(treeCV.reg$size, treeCV.reg$dev, type="b", main="CV Results: Regression Tree", xlab="Tree Size", ylab="Error")
+# Best at 9
+
+prune.reg = prune.tree(tree.reg, best=9)
+plot(prune.reg)
+text(prune.reg, pretty=0)
+# Both terminal nodes on the right are 1?
+
+prune.pred3 = predict(prune.reg, wine[-train,])
+prune.RMSE3 = sqrt(mean((prune.pred3 - wine[-train,"quality"])^2))
+print(paste("Regression Tree RMSE:",prune.RMSE3),quote=F)
+
+boxplot(prune.pred3 ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Regression Tree: Predicted vs Actual Values")
+```
+
+### Random Forest
+The random forest model indicates that the four most important variables are alcohol, sulphates, volatile acidity, and total sulfur dioxide, which is the same four that have been showing up in previous models.  The RMSE on the validation set is 0.5510, which is much lower than all previous models, including the linear model.  The plot shows a strong upward trend except at lower levels, where the predictions are very similar for each true rating value.
+
+```{r, out.width="50%"}
+#Random Forest
+set.seed(321)
+forest = randomForest(quality ~ ., data=wine, subset=train, importance=T)
+forest.pred = predict(forest, newdata=wine[-train,])
+forest.RMSE = sqrt(mean((forest.pred-wine[-train, "quality"])^2))
+print(paste("Random Forest RMSE:",forest.RMSE),quote=F)
+varImpPlot(forest, main="Important Variables")
+
+boxplot(forest.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Random Forest: Predicted vs Actual Values")
+```
+
+### Bagging
+Similar to the random forest, bagging gives an RMSE of 0.5521.  The top four important variables are identical to that of the random forest model.  Lower down, pH is given a higher importance level in this model.  The plot of predictions is also very similar to that of the random forest model.
+
+```{r,out.width="50%"}
+#Bagging
+set.seed(3231)
+bag = randomForest(quality ~ ., data=wine, subset=train, importance=T, mtry=ncol(X))
+bag.pred = predict(bag, newdata=wine[-train,])
+bag.RMSE = sqrt(mean((bag.pred-wine[-train, "quality"])^2))
+print(paste("Bagging RMSE:",bag.RMSE),quote=F)
+varImpPlot(bag, main="Important Variables")
+
+boxplot(bag.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Bagging: Predicted vs Actual Values")
+```
+
+### Boosting
+Boosting provides a different list of top four important variables.  This time, volatile acidity is at the top of the list, followed by alcohol, sulphates, and chlorides.  The plots show that quality increases whith alcohol and sulphates but decreases with volatile acidity.  This is consistent with the findings from the regression tree.  The boosting RMSE is 0.4942, which is another significant drop from all previous models.  The plot of predictions vs actual values has a strong positive trend, and is more distinct at the lower values than the random forest and bagging models.
+
+```{r, out.width="50%"}
+#Boosting
+set.seed(3431)
+boost = gbm(quality ~.,data=wine[-train,], distribution="gaussian",n.trees=200, interaction.depth=4, cv.folds=10)
+summary(boost)
+
+plot(boost, i="volatile.acidity", main="Quality vs Volatile Acidity", xlab="Volatile Acidity",ylab="Quality")
+plot(boost, i="alcohol", main="Quality vs Alcohol", xlab="Alcohol",ylab="Quality")
+plot(boost, i="sulphates", main="Quality vs Sulphates",xlab="Sulphates",ylab="Quality")
+
+boost.pred = predict(boost, wine[-train,])
+boost.RMSE = sqrt(mean((boost.pred-wine[-train, "quality"])^2))
+print(paste("Boost RMSE:",boost.RMSE),quote=F)
+boxplot(boost.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Boosting: Predicted vs Actual Values")
+```
+
+### Ridge Regression
+In an attempt to improve the linear regression model, which had a strong RMSE on its own, I will use several regularization techniques.  Ridge regression finds the best lambda value to be 0.04132.  This results in an RMSE of 0.6099, which is slightly higher than the standard linear regression.  The plot of predictions vs actual values is very similar to the linear regression as well.  This is likely due to a low lambda value, so decreases in variance don't appear to be worth the corresponding increase in bias.
+
+```{r, out.width="50%"}
+#Ridge
+set.seed(2000)
+
+grid = 10^seq(-3,5,length=100)
+model_ridge = cv.glmnet(x = as.matrix(X[train,]), y=Y[train], alpha=0, lambda=grid, standardize=TRUE)
+plot(model_ridge, main="Model Error by Lambda")
+plot(model_ridge$glmnet.fit, "lambda", label=FALSE, main="Coefficient Reduction")
+plot(model_ridge$glmnet.fit,xvar="dev",label=FALSE, main="Deviance")
+
+vip(model_ridge, num_features = 10, geom = "point", main="Most Important Variables")
+lambda_ridge = model_ridge$lambda.min
+print(paste("Best Lambda:",model_ridge$lambda.min),quote=FALSE)
+
+#Evaluation of best lambda
+model_cv_ridge = glmnet(x=as.matrix(X[train,]), y=Y[train], alpha=0, lambda = lambda_ridge, standardize=TRUE)
+ridge.pred = predict(model_cv_ridge, as.matrix(X[-train,]))
+ridge.RMSE = sqrt(mean((ridge.pred - Y[-train])^2))
+print(paste("Ridge RMSE:",ridge.RMSE),quote=F)
+
+boxplot(ridge.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Ridge: Predicted vs Actual Values")
+```
+
+### Lasso Regression
+Lasso finds very similar results.  It has a low lambda value and similar RMSE at 0.6109.  The model reduces fixed acidity, citric acid, and residual sugar coefficients to zero.  The plot of predictions is very similar to other models as well.  Estimating a separate linear model with the remaining variables gives a similar RMSE of 0.6115.
+
+```{r,out.width="50%"}
+#Lasso
+model.lasso = cv.glmnet(x = as.matrix(X[train,]), y=Y[train], alpha=1, lambda=grid, standardize=TRUE)
+plot(model.lasso, main="Model Error by Lambda")
+plot(model.lasso$glmnet.fit, "lambda", label=FALSE, main="Coefficient Reduction")
+plot(model.lasso$glmnet.fit,xvar="dev",label=FALSE, main="Deviance")
+
+vip(model.lasso, num_features = 10, geom = "point", main="Most Important Variables")
+lambda.lasso = model.lasso$lambda.min
+print(paste("Best Lambda:",model.lasso$lambda.min),quote=FALSE)
+
+#Evaluation of best lambda
+model_cv_lasso = glmnet(x=as.matrix(X[train,]), y=Y[train], alpha=1, lambda = lambda.lasso, standardize=TRUE)
+lasso.pred = predict(model_cv_lasso, as.matrix(X[-train,]))
+lasso.RMSE = sqrt(mean((lasso.pred - Y[-train])^2))
+print(paste("Lasso RMSE:",lasso.RMSE),quote=F)
+
+variable_importanceL = coef(model.lasso, s='lambda.min')
+ordered_var_imp_lasso = variable_importanceL[,1][order(-abs(variable_importanceL[,1]))]
+lasso.big = rownames(as.data.frame(ordered_var_imp_lasso[ordered_var_imp_lasso != 0]))
+lasso.zero = rownames(as.data.frame(ordered_var_imp_lasso[ordered_var_imp_lasso == 0]))
+print(paste("Coefficients Reduced to Zero:",paste(lasso.zero,collapse=", ")), quote=F)
+
+boxplot(lasso.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Lasso: Predicted vs Actual Values")
+
+#linear model without removed:
+lassoData = wine[,c(lasso.big[-1], "quality")]
+model.lasso2 = glm(quality ~ ., data=lassoData, subset=train)
+lasso.pred2 = predict(model.lasso2, wine[-train,])
+lasso.RMSE2 = sqrt(mean((lasso.pred2 - Y[-train])^2))
+print(paste("Linear with Lasso Selection RMSE:",lasso.RMSE2),quote=F)
+```
+
+### Elastic Net Regression
+Using elastic net provides similar results as well.  It gives a low lambda value (0.0236), reduce the same coefficients to zero, and give an RMSE of 0.6113.  The plot of predictions is still very similar.
+
+```{r, out.width="50%"}
+#ENet
+set.seed(787)
+model.enet = cv.glmnet(x = as.matrix(X[train,]), y=Y[train], alpha=0.5, lambda=grid, standardize=TRUE)
+plot(model.enet, main="Model Error by Lambda")
+plot(model.enet$glmnet.fit, "lambda", label=FALSE, main="Coefficient Reduction")
+plot(model.enet$glmnet.fit,xvar="dev",label=FALSE, main="Deviance")
+
+vip(model.enet, num_features = 10, geom = "point", main="Most Important Variables")
+lambda.enet = model.enet$lambda.min
+print(paste("Best Lambda:",model.enet$lambda.min),quote=FALSE)
+
+variable_importanceE = coef(model.enet, s='lambda.min')
+ordered_var_imp_enet = variable_importanceE[,1][order(-abs(variable_importanceE[,1]))]
+enet.big = rownames(as.data.frame(ordered_var_imp_enet[ordered_var_imp_enet != 0]))
+enet.zero = rownames(as.data.frame(ordered_var_imp_enet[ordered_var_imp_enet == 0]))
+print(paste("Coefficients Reduced to Zero:",paste(enet.zero, collapse=", ")),quote=F)
+
+#Evaluation of best lambda
+model_cv_enet = glmnet(x=as.matrix(X[train,]), y=Y[train], alpha=0.5, lambda = lambda.enet, standardize=TRUE)
+enet.pred = predict(model_cv_enet, as.matrix(X[-train,]))
+enet.RMSE = sqrt(mean((enet.pred - Y[-train])^2))
+print(paste("Elastic Net RMSE:",enet.RMSE),quote=F)
+
+boxplot(enet.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="ENet: Predicted vs Actual Values")
+```
+
+### Partial Components Analysis
+PCA is used to reduce the number of dimensions without completely annihilating a variable.  The model finds that the best cross validated error ocurrs at 9 out of 11 components.  It is worth noting, however, that the error is greatly reduced by the third component, accounting for only 60% of the variance in the predictor variables.  I will test models with both 9 and 3 components.  The PCA model with three components gives an RMSE on the validation set of 0.6327, and the model with nine gives an RMSE of 0.6117.  The plots of their predictions against the actual values are very similar and demonstrate some upward trend with less distinction at the extreme values.
+
+```{r, out.width="50%"}
+#PCA
+set.seed(2002)
+pcr.fit = pcr(quality ~ ., data=wine, scale=T, validation="CV", subset=train)
+summary(pcr.fit)
+
+pcr.pred1 = predict(pcr.fit, wine[-train,], ncomp=9)
+pcr.RMSE1 = sqrt(mean((pcr.pred1-Y[-train])^2))
+print(paste("PCA (9) RMSE:",pcr.RMSE1),quote=F)
+
+pcr.pred2 = predict(pcr.fit, wine[-train,], ncomp=3)
+pcr.RMSE2 = sqrt(mean((pcr.pred2-Y[-train])^2))
+print(paste("PCA (3) RMSE:",pcr.RMSE2),quote=F)
+
+boxplot(pcr.pred1 ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="PCA (9): Predicted vs Actual Values")
+
+boxplot(pcr.pred2 ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="PCA (3): Predicted vs Actual Values")
+```
+
+
+### Forward Stepwise Selection (Linear Model)
+In order to find the best subset of variables, I use forward stepwise selection, using both AIC and cross validation error.  Both methods find that seven variables should be used, and both methods agree on which variables to include.  Using this model, the validation set gives an RMSE of 0.6123, which is slightly more than the original linear model but uses four fewer variables.  The plot of predictions is very similar to previous models.
+
+```{r, out.width="33%"}
+#Forward Stepwise Selection:
+set.seed(655)
+used = c()
+variables = colnames(X)
+aicTotal = c()
+for(i in (1:ncol(X))){
+  aicStep = c()
+  for(variable in variables[!(variables %in% used)]){
+    formula = as.formula(paste("quality~",paste(used, collapse="+"),"+",variable, sep=""))
+    model = glm(formula, data=wine, subset=train)
+    aicStep[variable] = AIC(model)
+  }
+  pick = names(aicStep[which(aicStep == min(aicStep))])
+  used[i] = pick
+  aicTotal[i] = aicStep[pick]
+}
+plot(aicTotal, type='l', main="Stepwise Selection Results (AIC)",xlab="Number of Variables",ylab="AIC Score")
+print(paste("Used Variables (AIC):", paste(labels[used[(1:7)]], collapse=", ")), quote=F)
+print(paste("Unused Variables (AIC):",paste(labels[used[-(1:7)]], collapse=", ")), quote=F)
+#This corresponds to insignificant variables in the initial linear model
+
+used = c()
+variables = colnames(X)
+aicTotal = c()
+for(i in (1:ncol(X))){
+  aicStep = c()
+  for(variable in variables[!(variables %in% used)]){
+    formula = as.formula(paste("quality~",paste(used, collapse="+"),"+",variable, sep=""))
+    model = glm(formula, data=wine, subset=train)
+    aicStep[variable] = cv.glm(wine[train,], model, K=10)$delta[1] #AIC(model)
+  }
+  pick = names(aicStep[which(aicStep == min(aicStep))])
+  used[i] = pick
+  aicTotal[i] = aicStep[pick]
+}
+plot(aicTotal, type='l', main="Stepwise Selection Results (CV)",xlab="Number of Variables",ylab="CV Error")
+print(paste("Used Variables: (CV)", paste(labels[used[(1:7)]], collapse=", ")), quote=F)
+#Best at 7
+
+formula.best = as.formula(paste("quality~",paste(used[(1:7)],collapse="+"),"+",variable, sep=""))
+step.best = lm(formula.best, data=wine, subset=train)
+summary(step.best)
+step.pred = predict(step.best, wine[-train,])
+step.RMSE = sqrt(mean((step.pred - wine[-train, "quality"])^2))
+print(paste("Stepwise Selection RMSE:",step.RMSE),quote=F)
+
+
+boxplot(step.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Stepwise Selection: Predicted vs Actual Values")
+```
+
+### Forward Stepwise Selection (Nonlinear Model)
+In an attempt to capture any nonlinear relationships, I use forward stepwise selection with various degrees of each variable, ranging from 1 to 4.  I again use both AIC and cross validation error to find the best subset.  They again both agree on the same 18 variables, some of which are higher powers of other variables.  With all of these, the validation set RMSE is 0.6427, which is worse than a number of other models.  The prediction plot shows a strong upward trend across all values.  I do not focus on nonlinear models for this data set, since the discrete response variable might cause this to lead to overfitting, and previous models have shown strong linearity in the data as opposed to nonlinear models.
+
+```{r,out.width="33%"}
+#Nonlinear stepwise selection
+P = X
+predictors = colnames(X)
+powers = (2:4)
+for(pred in predictors){
+  for(d in powers){
+    cname = paste(pred, d, sep="")
+    P[,cname] = P[,pred]^d
+  }
+}
+
+set.seed(5676)
+used = c()
+variables = colnames(P)
+aicTotal = c()
+for(i in (1:ncol(P))){
+  aicStep = c()
+  for(variable in variables[!(variables %in% used)]){
+    formula = as.formula(paste("Y~",paste(used, collapse="+"),"+",variable, sep=""))
+    model = lm(formula, data=P, subset=train)
+    aicStep[variable] = AIC(model)
+  }
+  pick = names(aicStep[which(aicStep == min(aicStep))])
+  used[i] = pick
+  aicTotal[i] = aicStep[pick]
+}
+plot(aicTotal, type='l',main="Stepwise Selection Results (AIC)",xlab="Number of Variables",ylab="AIC Score")
+print(paste("Used Variables (AIC):", paste(used[(1:18)], collapse=", ")), quote=F)
+
+cvData2 = data.frame(Y,P)
+used = c()
+variables = colnames(P)
+aicTotal = c()
+for(i in (1:ncol(P))){
+  aicStep = c()
+  for(variable in variables[!(variables %in% used)]){
+    formula = as.formula(paste("Y~",paste(used, collapse="+"),"+",variable, sep=""))
+    model = glm(formula, data=P, subset=train)
+    aicStep[variable] = cv.glm(cvData2[train,], model, K=10)$delta[1]#AIC(model)
+  }
+  pick = names(aicStep[which(aicStep == min(aicStep))])
+  used[i] = pick
+  aicTotal[i] = aicStep[pick]
+}
+plot(aicTotal, type='l', main="Stepwise Selection Results (CV)",xlab="Number of Variables",ylab="CV Error")
+print(paste("Used Variables (CV):", paste(used[(1:18)], collapse=", ")), quote=F)
+
+print(paste("Best at",which(aicTotal == min(aicTotal))))
+#Best at 18
+
+formula.best2 = as.formula(paste("Y~",paste(used[(1:18)],collapse="+"),"+",variable, sep=""))
+step.best2 = lm(formula.best2, data=P, subset=train)
+summary(step.best2)
+step.pred2 = predict(step.best2, P[-train,])
+step.RMSE2 = sqrt(mean((step.pred2 - wine[-train, "quality"])^2))
+print(paste("Stepwise Selection (Nonlinear) RMSE:",step.RMSE2),quote=F)
+
+boxplot(step.pred2 ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Stepwise Selection: Predicted vs Actual Values")
+```
+
+### Conclusion
+At the end, boosting provides by far the most accurate model.  It is clear that there is predictive power within the variables, so physico-chemical properties of wine can be used to predict human preference.  In addition, several models indicated that the data follows more linear relationships.  The results from these models could be used to make more enjoyable wine even before tasting.  Improvements could be made if the data included more observations for extreme values, such as amazing or terrible wines.  This could allow the models to identify outstanding wines that should be pursued or failures that should not be produced.  One of the weaknesses of the data is the domination of the middle values, 5 and 6.  Even accounting for this in the beginning, wines can be categorized as above or below average and appropriately categorized with significant accuracy.
+
+### Source:
+https://archive.ics.uci.edu/ml/datasets/wine+quality
+
+
+### Source Code:
+
+```{r, eval=F, echo=T}
+#load data
+wine = read.csv("winequality-red.csv")
+head(wine)
+
+#Create labels for each variable
+labels = c(fixed.acidity="Fixed Acidity",
+           volatile.acidity="Volatile Acidity",
+           citric.acid="Citric Acid",
+           residual.sugar="Residual Sugar",
+           chlorides="Chlorides",
+           free.sulfur.dioxide="Free Sulfur Dioxide",
+           total.sulfur.dioxide="Total Sulfur Dioxide",
+           density="Density",
+           pH="pH",
+           sulphates="Sulphates",
+           alcohol="Alcohol",
+           quality="Quality")
+
+#Plot the data for each variable vs quality
+for(var in colnames(wine)[colnames(wine)!="quality"]){
+  formula = as.formula(paste(var,"~ quality"))
+  boxplot(formula, wine, horizontal=T, ylab="Quality",xlab=labels[var], main=labels[var])
+}
+
+#plot distribution of ratings
+barplot(table(wine$quality), xlab="Quality",ylab="Frequency",main="Frequency of Ratings")
+
+#Create dataframe of predictors, Y, training set
+X = wine
+X$quality = NULL
+Y = wine$quality
+
+set.seed(123)
+sampleSize = round(0.7*nrow(wine))
+train = sample((1:nrow(wine)),sampleSize)
+
+#Create a separate data set for binary classification
+wineC = wine
+wineC$quality = as.numeric(wineC$quality > 5)
+
+#Fit and evaluate a logistic model
+model.log = glm(quality ~ ., data = wineC, subset=train, family="binomial")
+summary(model.log)
+log.pred = round(predict(model.log, wineC[-train,], type="response"))
+table(log.pred, wineC[-train,"quality"])
+log.acc = mean(log.pred == wineC[-train, "quality"])
+print(paste("Logistic Binary Classification Accuracy:",log.acc),quote=F)
+
+#Fit and evaluate an LDA model
+train.control = trainControl(method = "cv", number = 10)
+lda.fit = lda(quality ~ ., data = wineC, subset=train)
+print(lda.fit)
+plot(lda.fit)
+
+lda.model = train(factor(quality) ~ ., data=wineC, method="lda", subset=train, trControl=train.control)
+print(lda.model)
+lda.pred = predict(lda.model, wineC[-train,])
+table(lda.pred, wineC[-train,"quality"])
+lda.acc = mean(lda.pred == wineC[-train, "quality"])
+print(paste("LDA Accuracy:",lda.acc),quote=FALSE)
+
+#Fit and evaluate a QDA model
+qda.model = train(factor(quality) ~ ., data=wineC, method="qda", subset=train, trControl=train.control)
+print(qda.model)
+qda.pred = predict(qda.model, wineC[-train,])
+table(qda.pred, wineC[-train,"quality"])
+qda.acc = mean(qda.pred == wineC[-train, "quality"])
+print(paste("QDA Accuracy:",qda.acc),quote=FALSE)
+
+#Fit and evaluate a KNN model
+set.seed(7564)
+knn.model = train(factor(quality) ~ ., data=wineC, method="knn", trControl = train.control, subset=train, preProcess=c("center","scale"), tuneLength=20)
+print(knn.model)
+plot(knn.model$results$k, knn.model$results$Accuracy, type='l', main="KNN CV Results",xlab="K",ylab="Accuracy")
+predK = predict(knn.model, wineC[-train,])
+table(predK, wineC[-train, "quality"])
+accuracyK = mean(predK == wineC[-train, "quality"])
+print(paste("KNN Accuracy:",accuracyK),quote=FALSE)
+
+#Fit and evaluate a Binary Classification Tree
+set.seed(959)
+tree.class = tree(factor(quality) ~ ., data=wineC, subset=train)
+summary(tree.class)
+
+plot(tree.class, main="Classification Tree")
+text(tree.class, pretty=0)
+
+treeCV.class = cv.tree(tree.class)
+plot(treeCV.class$size, treeCV.class$dev, type="b", main="CV Results: Classification Tree", xlab="Tree Size", ylab="Error")
+# Best at 5 or most complicated
+
+prune.class = prune.tree(tree.class, best=5)
+plot(prune.class)
+text(prune.class, pretty=0)
+# Both terminal nodes on the right are 1?
+
+class.pred = predict(tree.class, wineC[-train,], type="class")
+class.acc = mean(class.pred == wineC[-train, "quality"])
+print(paste("Full Tree Accuracy:",class.acc),quote=F)
+
+prune.pred = predict(prune.class, wineC[-train,], type="class")
+prune.acc = mean(prune.pred == wineC[-train, "quality"])
+print(paste("Pruned Tree Accuracy:",prune.acc),quote=F)
+
+#Fit and evaluate an SVC model
+set.seed(656)
+cost = 10^c(-3,-2, seq(-1,2, length=20), 3)
+#tune.out = tune(svm, as.factor(quality)~., data=wineC[train,], kernel="linear", ranges=list(cost=cost))
+tune.out = readRDS("tuneOutSVC.RData")
+tune.out$best.parameters
+
+svm1 = tune.out$best.model
+svm.pred = predict(svm1, wineC[-train,])
+table(svm.pred, wineC[-train, "quality"])
+svm.acc = mean(svm.pred == wineC[-train, "quality"])
+print(paste("SVC Accuracy:",svm.acc),quote=F)
+
+#Fit and evaluate a SVM (radial) model
+set.seed(650)
+cost = 10^c(-3,-2, seq(-1,2, length=20), 3)
+gamma = 10^c(-3,-2, seq(-1,2, length=10), 3)
+
+#tune.outR = tune(svm, as.factor(quality)~., data=wineC[train,], kernel="radial", ranges=list(cost=cost, gamma=gamma))
+tune.outR = readRDS("tuneOutR.RData")
+
+tune.outR$best.parameters
+
+svmR = tune.outR$best.model
+svmR.pred = predict(svmR, wineC[-train,])
+table(svmR.pred, wineC[-train, "quality"])
+svmR.acc = mean(svmR.pred == wineC[-train, "quality"])
+print(paste("SVM (Radial) Accuracy:",svmR.acc),quote=F)
+
+#Fit and evaluate an SVM (polynomial) model
+set.seed(659)
+degree = 10^c(-3,-2, seq(-1,2, length=20), 3)
+degree = 10^seq(-3,1.5, length=5)
+cost2 = 10^seq(-3,3,length=5)
+#tune.outP = tune(svm, as.factor(quality)~., data=wineC[train,], kernel="polynomial", ranges=list(cost=cost2, degree=degree))
+tune.outP = readRDS("tuneOutP.RData")
+tune.outP$best.parameters
+
+svmP = tune.outP$best.model
+svmP.pred = predict(svmP, wineC[-train,])
+table(svmP.pred, wineC[-train, "quality"])
+svmP.acc = mean(svmP.pred == wineC[-train, "quality"])
+print(paste("SVM (Polynomial) Accuracy:",svmP.acc))
+
+#Fit and analyze a K-Means clustering model
+set.seed(4)
+totalAccK = c()
+C=2
+kmean_model = kmeans(wineC[,-12], centers=C)
+
+fviz_cluster(kmean_model, data=wineC[,-12], main="Clusters", repel=TRUE)
+
+results = c(Good=1,Bad=0)
+accuracyKM = 0
+for(k in (1:C)){
+  print(paste("Cluster",k), quote=FALSE)
+  result = wineC$quality[kmean_model$cluster == k]
+  choice = c()
+  for(res in names(results)){
+    choice[res] = sum(result == results[res])/length(result)
+    print(paste(names(results[which(results==results[res])]),":",choice[res]),quote=FALSE)
+  }
+  choice1 = names(choice[which(choice==max(choice))])
+  accuracyKM = accuracyKM + sum(result == results[choice1])
+}
+
+#Use the mean quality to find a benchmark RMSE
+set.seed(555)
+#Mean benchmark:
+mean.pred = rep(mean(wine[train,"quality"]),nrow(wine)-sampleSize)
+mean.RMSE = sqrt(mean((mean.pred-wine[-train,"quality"])^2))
+print(paste("RMSE from Training Mean:",mean.RMSE),quote=F)
+
+#Fit a multinomial logistic model
+model.log2 = train(factor(quality) ~ ., data=wine, method="multinom", trControl = train.control, subset=train)
+
+#Create a function to convert factors to numbers
+factorToNum = function(v){
+  return(as.numeric(as.character(v)))
+}
+
+#Evaluate model
+summary(model.log2)
+log.pred2 = predict(model.log2, wine[-train,])
+table(log.pred2, wine[-train,"quality"])
+log.acc2 = mean(log.pred2 == wine[-train, "quality"])
+print(paste("Logistic Multiclass Accuracy:",log.acc2),quote=F)
+
+log.RMSE = sqrt(mean((factorToNum(log.pred2) - wine[-train, "quality"])^2))
+print(paste("Logistic RMSE:",log.RMSE),quote=F)
+
+boxplot(factorToNum(log.pred2) ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Logistic: Predicted vs Actual Values")
+
+#Fit and evaluate a multi class LDA model
+lda.fit2 = lda(quality ~ ., data = wine, subset=train)
+print(lda.fit2)
+plot(lda.fit2)
+
+lda.model2 = train(factor(quality) ~ ., data=wine, method="lda", subset=train, trControl=train.control)
+print(lda.model2)
+lda.pred2 = predict(lda.model2, wine[-train,])
+table(lda.pred2, wine[-train,"quality"])
+lda.acc2 = mean(lda.pred2 == wine[-train, "quality"])
+print(paste("LDA Accuracy:",lda.acc2),quote=FALSE)
+
+lda.RMSE = sqrt(mean((factorToNum(lda.pred2) - wine[-train,"quality"])^2))
+print(paste("LDA RMSE:",lda.RMSE),quote=F)
+boxplot(factorToNum(lda.pred2) ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="LDA: Predicted vs Actual Values")
+
+#Fit and evaluate a multiclass KNN model
+set.seed(340)
+knn.model2 = train(factor(quality) ~ ., data=wine, method="knn", trControl = train.control, subset=train, preProcess=c("center","scale"), tuneLength=50)
+print(knn.model2)
+plot(knn.model2$results$k, knn.model2$results$Accuracy, type='l', ylab="Accuracy",xlab="K",main="KNN CV Results")
+predK2 = predict(knn.model2, wine[-train,])
+table(predK2, wine[-train, "quality"])
+accuracyK2 = mean(predK2 == wine[-train, "quality"])
+print(paste("KNN Accuracy:",accuracyK2),quote=FALSE)
+
+knn.RMSE = sqrt(mean((factorToNum(predK2) - wine[-train, "quality"])^2))
+print(paste("KNN RMSE:",knn.RMSE))
+plot(predK2, wine[-train,"quality"], xlab="Predictions",ylab="Actual",main="KNN: Predicted vs Actual Values")
+boxplot(factorToNum(predK2) ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="KNN: Predicted vs Actual Values")
+
+#Fit and evaluate a multiclass classification tree
+set.seed(959)
+tree.class2 = tree(factor(quality) ~ ., data=wine, subset=train)
+summary(tree.class2)
+
+plot(tree.class2, main="Classification Tree")
+text(tree.class2, pretty=0)
+
+treeCV.class2 = cv.tree(tree.class2)
+plot(treeCV.class2$size, treeCV.class2$dev, type="b", main="CV Results: Classification Tree", xlab="Tree Size", ylab="Error")
+# Best at 6
+
+prune.class2 = prune.tree(tree.class2, best=6)
+plot(prune.class2)
+text(prune.class2, pretty=0)
+# Both terminal nodes on the right are 1?
+
+prune.pred2 = predict(prune.class2, wine[-train,], type="class")
+prune.acc2 = mean(prune.pred2 == wine[-train, "quality"])
+print(paste("Pruned Accuracy:",prune.acc2),quote=F)
+
+prune.RMSE = sqrt(mean((factorToNum(prune.pred2) - wine[-train,"quality"])^2))
+print(paste("Pruned RMSE:",prune.RMSE),quote=F)
+
+boxplot(factorToNum(prune.pred2) ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Classification Tree: Predicted vs Actual Values")
+
+#Fit and analyze K-means clusters with 6 centers
+set.seed(5556)
+kmean_model2 = kmeans(wine[,-12], centers=6)
+
+fviz_cluster(kmean_model2, data=wine[,-12], main="Clusters", repel=TRUE)
+
+results = (3:8)
+for(k in (1:6)){
+  print(paste("Cluster",k), quote=FALSE)
+  result = wine$quality[kmean_model2$cluster == k]
+  for(res in results){
+    frequ = sum(result == res)/length(result)
+    print(paste(res,":",frequ),quote=FALSE)
+  }
+}
+
+#Fit and evaluate a linear model for a benchmark in regression
+lin_model = lm(quality ~., data=wine)
+summary(lin_model)
+lin.pred = predict(lin_model, newdata=wine[-train,])
+lin.RMSE = sqrt(mean((lin.pred-wine[-train,"quality"])^2))
+print(paste("Linear RMSE:",lin.RMSE),quote=F)
+boxplot(lin.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Linear: Predicted vs Actual Values")
+
+#Fit and evaluate a regression tree
+set.seed(9595)
+tree.reg = tree(quality ~ ., data=wine, subset=train)
+summary(tree.reg)
+
+plot(tree.reg, main="Classification Tree")
+text(tree.reg, pretty=0)
+
+treeCV.reg = cv.tree(tree.reg)
+plot(treeCV.reg$size, treeCV.reg$dev, type="b", main="CV Results: Classification Tree", xlab="Tree Size", ylab="Error")
+# Best at 9
+
+prune.reg = prune.tree(tree.reg, best=9)
+plot(prune.reg)
+text(prune.reg, pretty=0)
+# Both terminal nodes on the right are 1?
+
+prune.pred3 = predict(prune.reg, wine[-train,])
+prune.RMSE3 = sqrt(mean((prune.pred3 - wine[-train,"quality"])^2))
+print(paste("Regression Tree RMSE:",prune.RMSE3),quote=F)
+
+boxplot(prune.pred3 ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Regression Tree: Predicted vs Actual Values")
+
+#Fit and evaluate random forest model
+set.seed(321)
+forest = randomForest(quality ~ ., data=wine, subset=train, importance=T)
+forest.pred = predict(forest, newdata=wine[-train,])
+forest.RMSE = sqrt(mean((forest.pred-wine[-train, "quality"])^2))
+print(paste("Random Forest RMSE:",forest.RMSE),quote=F)
+varImpPlot(forest, main="Important Variables")
+
+boxplot(forest.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Random Forest: Predicted vs Actual Values")
+
+#Fit and evaluate bagging model
+set.seed(3231)
+bag = randomForest(quality ~ ., data=wine, subset=train, importance=T, mtry=ncol(X))
+bag.pred = predict(bag, newdata=wine[-train,])
+bag.RMSE = sqrt(mean((bag.pred-wine[-train, "quality"])^2))
+print(paste("Bagging RMSE:",bag.RMSE),quote=F)
+varImpPlot(bag, main="Important Variables")
+
+boxplot(bag.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Bagging: Predicted vs Actual Values")
+
+#Fit and evaluate boosting model
+set.seed(3431)
+boost = gbm(quality ~.,data=wine[-train,], distribution="gaussian",n.trees=200, interaction.depth=4, cv.folds=10)
+summary(boost)
+
+plot(boost, i="volatile.acidity", main="Quality vs Volatile Acidity", xlab="Volatile Acidity",ylab="Quality")
+plot(boost, i="alcohol", main="Quality vs Alcohol", xlab="Alcohol",ylab="Quality")
+plot(boost, i="sulphates", main="Quality vs Sulphates",xlab="Sulphates",ylab="Quality")
+
+boost.pred = predict(boost, wine[-train,])
+boost.RMSE = sqrt(mean((boost.pred-wine[-train, "quality"])^2))
+print(paste("Boost RMSE:",boost.RMSE),quote=F)
+boxplot(boost.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Boosting: Predicted vs Actual Values")
+
+#Fit ridge regression model
+set.seed(2000)
+
+grid = 10^seq(-3,5,length=100)
+model_ridge = cv.glmnet(x = as.matrix(X[train,]), y=Y[train], alpha=0, lambda=grid, standardize=TRUE)
+plot(model_ridge, main="Model Error by Lambda")
+plot(model_ridge$glmnet.fit, "lambda", label=FALSE, main="Coefficient Reduction")
+plot(model_ridge$glmnet.fit,xvar="dev",label=FALSE, main="Deviance")
+
+vip(model_ridge, num_features = 10, geom = "point", main="Most Important Variables")
+lambda_ridge = model_ridge$lambda.min
+print(paste("Best Lambda:",model_ridge$lambda.min),quote=FALSE)
+
+#Evaluation of best lambda
+model_cv_ridge = glmnet(x=as.matrix(X[train,]), y=Y[train], alpha=0, lambda = lambda_ridge, standardize=TRUE)
+ridge.pred = predict(model_cv_ridge, as.matrix(X[-train,]))
+ridge.RMSE = sqrt(mean((ridge.pred - Y[-train])^2))
+print(paste("Ridge RMSE:",ridge.RMSE),quote=F)
+
+boxplot(ridge.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Ridge: Predicted vs Actual Values")
+
+#Fit lasso regression model
+model.lasso = cv.glmnet(x = as.matrix(X[train,]), y=Y[train], alpha=1, lambda=grid, standardize=TRUE)
+plot(model.lasso, main="Model Error by Lambda")
+plot(model.lasso$glmnet.fit, "lambda", label=FALSE, main="Coefficient Reduction")
+plot(model.lasso$glmnet.fit,xvar="dev",label=FALSE, main="Deviance")
+
+vip(model.lasso, num_features = 10, geom = "point", main="Most Important Variables")
+lambda.lasso = model.lasso$lambda.min
+print(paste("Best Lambda:",model.lasso$lambda.min),quote=FALSE)
+
+#Evaluation of best lambda
+model_cv_lasso = glmnet(x=as.matrix(X[train,]), y=Y[train], alpha=1, lambda = lambda.lasso, standardize=TRUE)
+lasso.pred = predict(model_cv_lasso, as.matrix(X[-train,]))
+lasso.RMSE = sqrt(mean((lasso.pred - Y[-train])^2))
+print(paste("Lasso RMSE:",lasso.RMSE),quote=F)
+
+variable_importanceL = coef(model.lasso, s='lambda.min')
+ordered_var_imp_lasso = variable_importanceL[,1][order(-abs(variable_importanceL[,1]))]
+lasso.big = rownames(as.data.frame(ordered_var_imp_lasso[ordered_var_imp_lasso != 0]))
+lasso.zero = rownames(as.data.frame(ordered_var_imp_lasso[ordered_var_imp_lasso == 0]))
+print(paste("Coefficients Reduced to Zero:",paste(lasso.zero,collapse=", ")), quote=F)
+
+boxplot(lasso.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Lasso: Predicted vs Actual Values")
+
+#linear model without removed:
+lassoData = wine[,c(lasso.big[-1], "quality")]
+model.lasso2 = glm(quality ~ ., data=lassoData, subset=train)
+lasso.pred2 = predict(model.lasso2, wine[-train,])
+lasso.RMSE2 = sqrt(mean((lasso.pred2 - Y[-train])^2))
+print(paste("Linear with Lasso Selection RMSE:",lasso.RMSE2),quote=F)
+
+#Fit ENet regression model
+set.seed(787)
+model.enet = cv.glmnet(x = as.matrix(X[train,]), y=Y[train], alpha=0.5, lambda=grid, standardize=TRUE)
+plot(model.enet, main="Model Error by Lambda")
+plot(model.enet$glmnet.fit, "lambda", label=FALSE, main="Coefficient Reduction")
+plot(model.enet$glmnet.fit,xvar="dev",label=FALSE, main="Deviance")
+
+vip(model.enet, num_features = 10, geom = "point", main="Most Important Variables")
+lambda.enet = model.enet$lambda.min
+print(paste("Best Lambda:",model.enet$lambda.min),quote=FALSE)
+
+variable_importanceE = coef(model.enet, s='lambda.min')
+ordered_var_imp_enet = variable_importanceE[,1][order(-abs(variable_importanceE[,1]))]
+enet.big = rownames(as.data.frame(ordered_var_imp_enet[ordered_var_imp_enet != 0]))
+enet.zero = rownames(as.data.frame(ordered_var_imp_enet[ordered_var_imp_enet == 0]))
+print(paste("Coefficients Reduced to Zero:",paste(enet.zero, collapse=", ")),quote=F)
+
+#Evaluation of best lambda
+model_cv_enet = glmnet(x=as.matrix(X[train,]), y=Y[train], alpha=0.5, lambda = lambda.enet, standardize=TRUE)
+enet.pred = predict(model_cv_enet, as.matrix(X[-train,]))
+enet.RMSE = sqrt(mean((enet.pred - Y[-train])^2))
+print(paste("Elastic Net RMSE:",enet.RMSE),quote=F)
+
+boxplot(enet.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="ENet: Predicted vs Actual Values")
+
+#Fit and evaluate PCA model
+set.seed(2002)
+pcr.fit = pcr(quality ~ ., data=wine, scale=T, validation="CV", subset=train)
+summary(pcr.fit)
+
+pcr.pred1 = predict(pcr.fit, wine[-train,], ncomp=9)
+pcr.RMSE1 = sqrt(mean((pcr.pred1-Y[-train])^2))
+print(paste("PCA (9) RMSE:",pcr.RMSE1),quote=F)
+
+pcr.pred2 = predict(pcr.fit, wine[-train,], ncomp=3)
+pcr.RMSE2 = sqrt(mean((pcr.pred2-Y[-train])^2))
+print(paste("PCA (3) RMSE:",pcr.RMSE2),quote=F)
+
+boxplot(pcr.pred1 ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="PCA (9): Predicted vs Actual Values")
+
+boxplot(pcr.pred2 ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="PCA (3): Predicted vs Actual Values")
+
+#Use stepwise selection (AIC)
+set.seed(655)
+used = c()
+variables = colnames(X)
+aicTotal = c()
+for(i in (1:ncol(X))){
+  aicStep = c()
+  for(variable in variables[!(variables %in% used)]){
+    formula = as.formula(paste("quality~",paste(used, collapse="+"),"+",variable, sep=""))
+    model = glm(formula, data=wine, subset=train)
+    aicStep[variable] = AIC(model)
+  }
+  pick = names(aicStep[which(aicStep == min(aicStep))])
+  used[i] = pick
+  aicTotal[i] = aicStep[pick]
+}
+plot(aicTotal, type='l', main="Stepwise Selection Results (AIC)",xlab="Number of Variables",ylab="AIC Score")
+print(paste("Used Variables (AIC):", paste(labels[used[(1:7)]], collapse=", ")), quote=F)
+print(paste("Unused Variables (AIC):",paste(labels[used[-(1:7)]], collapse=", ")), quote=F)
+#This corresponds to insignificant variables in the initial linear model
+
+#Use stepwise selection (CV)
+used = c()
+variables = colnames(X)
+aicTotal = c()
+for(i in (1:ncol(X))){
+  aicStep = c()
+  for(variable in variables[!(variables %in% used)]){
+    formula = as.formula(paste("quality~",paste(used, collapse="+"),"+",variable, sep=""))
+    model = glm(formula, data=wine, subset=train)
+    aicStep[variable] = cv.glm(wine[train,], model, K=10)$delta[1] #AIC(model)
+  }
+  pick = names(aicStep[which(aicStep == min(aicStep))])
+  used[i] = pick
+  aicTotal[i] = aicStep[pick]
+}
+plot(aicTotal, type='l', main="Stepwise Selection Results (CV)",xlab="Number of Variables",ylab="CV Error")
+print(paste("Used Variables: (CV)", paste(labels[used[(1:7)]], collapse=", ")), quote=F)
+#Best at 7
+
+formula.best = as.formula(paste("quality~",paste(used[(1:7)],collapse="+"),"+",variable, sep=""))
+step.best = lm(formula.best, data=wine, subset=train)
+summary(step.best)
+step.pred = predict(step.best, wine[-train,])
+step.RMSE = sqrt(mean((step.pred - wine[-train, "quality"])^2))
+print(paste("Stepwise Selection RMSE:",step.RMSE),quote=F)
+
+
+boxplot(step.pred ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Stepwise Selection: Predicted vs Actual Values")
+
+#use stepwise selection for nonlinear variables (AIC)
+P = X
+predictors = colnames(X)
+powers = (2:4)
+for(pred in predictors){
+  for(d in powers){
+    cname = paste(pred, d, sep="")
+    P[,cname] = P[,pred]^d
+  }
+}
+
+set.seed(5676)
+used = c()
+variables = colnames(P)
+aicTotal = c()
+for(i in (1:ncol(P))){
+  aicStep = c()
+  for(variable in variables[!(variables %in% used)]){
+    formula = as.formula(paste("Y~",paste(used, collapse="+"),"+",variable, sep=""))
+    model = lm(formula, data=P, subset=train)
+    aicStep[variable] = AIC(model)
+  }
+  pick = names(aicStep[which(aicStep == min(aicStep))])
+  used[i] = pick
+  aicTotal[i] = aicStep[pick]
+}
+plot(aicTotal, type='l',main="Stepwise Selection Results (AIC)",xlab="Number of Variables",ylab="AIC Score")
+print(paste("Used Variables (AIC):", paste(used[(1:18)], collapse=", ")), quote=F)
+
+#Use stepwise selection for nonlinear variables (CV)
+cvData2 = data.frame(Y,P)
+used = c()
+variables = colnames(P)
+aicTotal = c()
+for(i in (1:ncol(P))){
+  aicStep = c()
+  for(variable in variables[!(variables %in% used)]){
+    formula = as.formula(paste("Y~",paste(used, collapse="+"),"+",variable, sep=""))
+    model = glm(formula, data=P, subset=train)
+    aicStep[variable] = cv.glm(cvData2[train,], model, K=10)$delta[1]#AIC(model)
+  }
+  pick = names(aicStep[which(aicStep == min(aicStep))])
+  used[i] = pick
+  aicTotal[i] = aicStep[pick]
+}
+plot(aicTotal, type='l', main="Stepwise Selection Results (CV)",xlab="Number of Variables",ylab="CV Error")
+print(paste("Used Variables (CV):", paste(used[(1:18)], collapse=", ")), quote=F)
+
+print(paste("Best at",which(aicTotal == min(aicTotal))))
+#Best at 18
+
+formula.best2 = as.formula(paste("Y~",paste(used[(1:18)],collapse="+"),"+",variable, sep=""))
+step.best2 = lm(formula.best2, data=P, subset=train)
+summary(step.best2)
+step.pred2 = predict(step.best2, P[-train,])
+step.RMSE2 = sqrt(mean((step.pred2 - wine[-train, "quality"])^2))
+print(paste("Stepwise Selection (Nonlinear) RMSE:",step.RMSE2),quote=F)
+
+boxplot(step.pred2 ~ wine[-train,"quality"], horizontal=T, xlab="Predictions",ylab="Actual",main="Stepwise Selection: Predicted vs Actual Values")
+```
